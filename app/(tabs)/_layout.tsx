@@ -15,6 +15,7 @@ import {
 import { Stack } from 'expo-router';
 import { Ionicons } from '@expo/vector-icons';
 import * as Notifications from 'expo-notifications';
+import { requestAuthorization, getMostRecentQuantitySample, HKQuantityTypeIdentifier } from '@kingstinct/react-native-healthkit';
 
 // --- NOTIFICATION HANDLER ---
 Notifications.setNotificationHandler({
@@ -142,37 +143,58 @@ export default function HomeScreen() {
 
     setIsSyncing(true);
 
-    setTimeout(async () => {
-      // Widening the random range for testing: 40 to 160 BPM
-      const randomBpm = Math.floor(Math.random() * (160 - 40 + 1)) + 40;
-      const now = new Date();
-      const content = getActiveContent(randomBpm);
+    let actualBpm = 0;
 
-      const newLog: SyncLog = {
-        id: Math.random().toString(),
-        time: now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-        date: now.toLocaleDateString([], { month: 'long', day: 'numeric' }),
-        bpm: randomBpm,
-        status: content.emotion,
-        verse: content.verse,
-        fullText: content.text
-      };
+    try {
+      if (Platform.OS === 'ios') {
+        // Request HealthKit permission and fetch
+        await requestAuthorization([HKQuantityTypeIdentifier.heartRate]);
+        const sample = await getMostRecentQuantitySample(HKQuantityTypeIdentifier.heartRate);
+        if (sample && sample.quantity) {
+          actualBpm = Math.round(sample.quantity);
+        }
+      } else if (Platform.OS === 'android') {
+        alert("Android Health Connect support is coming soon!");
+        setIsSyncing(false);
+        return;
+      }
+    } catch (error) {
+      console.error("Error fetching health data:", error);
+    }
 
-      setBpm(randomBpm);
+    if (actualBpm === 0) {
+      alert("No recent heart rate data found on your device. Please ensure your watch is synced with Health/Fit.");
       setIsSyncing(false);
-      setLogs(prev => [newLog, ...prev].slice(0, 10));
+      return;
+    }
 
-      await Notifications.scheduleNotificationAsync({
-        content: {
-          title: `💬 Heart Guidance: ${content.emotion}`,
-          subtitle: `${content.verse} • ${randomBpm} BPM`,
-          body: `"${content.text}"`,
-          ios: { interruptionLevel: 'timeSensitive' },
-          ...Platform.select({ android: { channelId: 'messages' } })
-        },
-        trigger: null,
-      });
-    }, 2000);
+    const now = new Date();
+    const content = getActiveContent(actualBpm);
+
+    const newLog: SyncLog = {
+      id: Math.random().toString(),
+      time: now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+      date: now.toLocaleDateString([], { month: 'long', day: 'numeric' }),
+      bpm: actualBpm,
+      status: content.emotion,
+      verse: content.verse,
+      fullText: content.text
+    };
+
+    setBpm(actualBpm);
+    setIsSyncing(false);
+    setLogs(prev => [newLog, ...prev].slice(0, 10));
+
+    await Notifications.scheduleNotificationAsync({
+      content: {
+        title: `💬 Heart Guidance: ${content.emotion}`,
+        subtitle: `${content.verse} • ${actualBpm} BPM`,
+        body: `"${content.text}"`,
+        ios: { interruptionLevel: 'timeSensitive' },
+        ...Platform.select({ android: { channelId: 'messages' } })
+      },
+      trigger: null,
+    });
   };
 
   return (

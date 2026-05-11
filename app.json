@@ -39,6 +39,13 @@
             "backgroundColor": "#1A1A1A"
           }
         }
+      ],
+      [
+        "@kingstinct/react-native-healthkit",
+        {
+          "NSHealthShareUsageDescription": "We need access to your health data to monitor your live heart rate.",
+          "NSHealthUpdateUsageDescription": "We need access to your health data to track your live heart rate."
+        }
       ]
     ],
     "experiments": {
