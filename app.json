@@ -9,7 +9,13 @@
     "userInterfaceStyle": "automatic",
     "newArchEnabled": true,
     "ios": {
-      "supportsTablet": true
+      "supportsTablet": true,
+      "bundleIdentifier": "com.saintluwis.HV",
+      "infoPlist": {
+        "NSAppTransportSecurity": {
+          "NSAllowsLocalNetworking": true
+        }
+      }
     },
     "android": {
       "adaptiveIcon": {
@@ -19,7 +25,13 @@
         "monochromeImage": "./assets/images/icon.png"
       },
       "edgeToEdgeEnabled": true,
-      "predictiveBackGestureEnabled": false
+      "predictiveBackGestureEnabled": false,
+      "package": "com.saintluwis.HV",
+      "permissions": [
+        "android.permission.health.READ_HEART_RATE",
+        "android.permission.health.READ_STEPS",
+        "android.permission.health.READ_BASAL_METABOLIC_RATE"
+      ]
     },
     "web": {
       "output": "static",
@@ -46,7 +58,25 @@
           "NSHealthShareUsageDescription": "We need access to your health data to monitor your live heart rate.",
           "NSHealthUpdateUsageDescription": "We need access to your health data to track your live heart rate."
         }
-      ]
+      ],
+      [
+        "react-native-health-connect",
+        {
+          "privacyPolicyUrl": "https://saintluwis.github.io/HV/privacy-policy"
+        }
+      ],
+      [
+        "expo-build-properties",
+        {
+          "android": {
+            "minSdkVersion": 26,
+            "compileSdkVersion": 35,
+            "targetSdkVersion": 35
+          }
+        }
+      ],
+      "expo-web-browser",
+      "./plugins/withHealthConnectAndroid14"
     ],
     "experiments": {
       "typedRoutes": true,
@@ -55,7 +85,7 @@
     "extra": {
       "router": {},
       "eas": {
-        "projectId": "6bfc5d62-8350-42d3-afbc-87a2f5bb6dc2"
+        "projectId": "db2a7c44-8dc6-4ad4-9181-e9096ec1f42d"
       }
     }
   }

@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { 
   StyleSheet, 
   Text, 
@@ -8,23 +8,30 @@ import {
   ActivityIndicator, 
   StatusBar, 
   ScrollView, 
-  Platform, 
+  Platform,
   Modal,
-  Pressable
+  Pressable,
 } from 'react-native';
-import { Stack } from 'expo-router';
+import { Stack, useRouter } from 'expo-router';
 import { Ionicons } from '@expo/vector-icons';
 import * as Notifications from 'expo-notifications';
-import { requestAuthorization, getMostRecentQuantitySample, HKQuantityTypeIdentifier } from '@kingstinct/react-native-healthkit';
 
-// --- NOTIFICATION HANDLER ---
-Notifications.setNotificationHandler({
-  handleNotification: async () => ({
-    shouldShowAlert: true,
-    shouldPlaySound: true,
-    shouldSetBadge: true,
-  }),
-});
+import { useHeartRateMonitor } from '@/hooks/useHeartRateMonitor';
+
+// Android-only: set up local notification handler
+if (Platform.OS === 'android') {
+  Notifications.setNotificationHandler({
+    handleNotification: async () => ({
+      shouldShowBanner: true,
+      shouldShowList: true,
+      shouldPlaySound: true,
+      shouldSetBadge: false,
+    }),
+  });
+}
+
+/** How long (ms) before a reading is shown as stale in the "last polled" indicator. */
+const STALE_DISPLAY_THRESHOLD_MS = 60_000;
 
 interface VerseContent {
   emotion: string;
@@ -98,12 +105,54 @@ const verseData: Record<string, VerseContent> = {
 };
 
 export default function HomeScreen() {
-  const [bpm, setBpm] = useState(0);
-  const [isSyncing, setIsSyncing] = useState(false);
-  const [hasPermission, setHasPermission] = useState(false);
+  const router = useRouter();
   const [logs, setLogs] = useState<SyncLog[]>([]);
   const [selectedLog, setSelectedLog] = useState<SyncLog | null>(null);
   const [modalVisible, setModalVisible] = useState(false);
+  const [isSimulating, setIsSimulating] = useState(false);
+  const [watchTipDismissed, setWatchTipDismissed] = useState(false);
+  // DEV simulation interval — separate from the real monitoring hook
+  const simulatePollInterval = useRef<ReturnType<typeof setInterval> | null>(null);
+  // Simulated BPM state (only used in DEV simulate mode)
+  const [simBpm, setSimBpm] = useState<number | null>(null);
+  // Tracks the last BPM value for which an Android notification was sent.
+  // Prevents duplicate notifications when Health Connect returns the same
+  // cached reading on consecutive poll ticks.
+  const lastNotifiedBpmRef = useRef<number | null>(null);
+
+  // ── Heart rate monitoring hook ──────────────────────────────────────────
+  // onNewBpm callback: builds a SyncLog entry and fires an Android notification
+  const handleNewBpm = useCallback(async (newBpm: number, updatedAt: Date) => {
+    const content = getActiveContent(newBpm);
+    const newLog: SyncLog = {
+      id: Math.random().toString(),
+      time: updatedAt.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+      date: updatedAt.toLocaleDateString([], { month: 'long', day: 'numeric' }),
+      bpm: newBpm,
+      status: content.emotion,
+      verse: content.verse,
+      fullText: content.text,
+    };
+    setLogs(prev => [newLog, ...prev].slice(0, 10));
+
+    if (Platform.OS === 'android' && newBpm !== lastNotifiedBpmRef.current) {
+      lastNotifiedBpmRef.current = newBpm;
+      await Notifications.scheduleNotificationAsync({
+        content: {
+          title: `💬 Heart Guidance: ${content.emotion}`,
+          body: `${content.verse} • ${newBpm} BPM — "${content.text}"`,
+        },
+        trigger: null,
+      });
+    }
+  }, []);
+
+  const monitor = useHeartRateMonitor(handleNewBpm);
+
+  // Effective BPM: prefer hook value; fall back to DEV simulated BPM
+  const effectiveBpm = isSimulating ? (simBpm ?? 0) : (monitor.bpm ?? 0);
+  const effectiveMonitoring = monitor.isMonitoring || isSimulating;
+  const effectivePermission = monitor.permissionGranted || isSimulating;
 
   // --- DYNAMIC SELECTION LOGIC ---
   const getActiveContent = (currentBpm: number): VerseContent => {
@@ -116,121 +165,160 @@ export default function HomeScreen() {
     return verseData.tachycardia;
   };
 
-  const activeContent = getActiveContent(bpm);
-  const themeColor = activeContent.color;
-
+  // Set up Android notification channel once on mount
   useEffect(() => {
-    setupNotifications();
+    if (Platform.OS === 'android') {
+      (async () => {
+        await Notifications.setNotificationChannelAsync('messages', {
+          name: 'Heart Guidance',
+          importance: Notifications.AndroidImportance.MAX,
+        });
+        const { status } = await Notifications.getPermissionsAsync();
+        if (status !== 'granted') await Notifications.requestPermissionsAsync();
+      })();
+    }
   }, []);
 
-  const setupNotifications = async () => {
-    if (Platform.OS === 'android') {
-      await Notifications.setNotificationChannelAsync('messages', {
-        name: 'Heart Guidance',
-        importance: Notifications.AndroidImportance.MAX,
-      });
-    }
-    const { status } = await Notifications.getPermissionsAsync();
-    setHasPermission(status === 'granted');
-  };
-
-  const syncHealthData = async () => {
-    if (!hasPermission) {
-      const { status } = await Notifications.requestPermissionsAsync();
-      setHasPermission(status === 'granted');
-      if (status !== 'granted') return;
-    }
-
-    setIsSyncing(true);
-
-    let actualBpm = 0;
-
-    try {
-      if (Platform.OS === 'ios') {
-        // Request HealthKit permission and fetch
-        await requestAuthorization([HKQuantityTypeIdentifier.heartRate]);
-        const sample = await getMostRecentQuantitySample(HKQuantityTypeIdentifier.heartRate);
-        if (sample && sample.quantity) {
-          actualBpm = Math.round(sample.quantity);
-        }
-      } else if (Platform.OS === 'android') {
-        alert("Android Health Connect support is coming soon!");
-        setIsSyncing(false);
-        return;
+  // Clean up DEV simulation interval on unmount
+  useEffect(() => {
+    return () => {
+      if (simulatePollInterval.current) {
+        clearInterval(simulatePollInterval.current);
+        simulatePollInterval.current = null;
       }
-    } catch (error) {
-      console.error("Error fetching health data:", error);
-    }
+    };
+  }, []);
 
-    if (actualBpm === 0) {
-      alert("No recent heart rate data found on your device. Please ensure your watch is synced with Health/Fit.");
-      setIsSyncing(false);
+  const activeContent = getActiveContent(effectiveBpm);
+  const themeColor = activeContent.color;
+
+
+  /** Toggle monitoring via the hook, or stop DEV simulation. */
+  const toggleMonitoring = async () => {
+    if (effectiveMonitoring) {
+      // Stop real monitoring
+      monitor.stopMonitoring();
+      // Stop DEV simulation if active
+      if (simulatePollInterval.current) {
+        clearInterval(simulatePollInterval.current);
+        simulatePollInterval.current = null;
+      }
+      setIsSimulating(false);
+      setSimBpm(null);
+      // Reset notification dedup so next session sends a fresh first notification
+      lastNotifiedBpmRef.current = null;
       return;
     }
-
-    const now = new Date();
-    const content = getActiveContent(actualBpm);
-
-    const newLog: SyncLog = {
-      id: Math.random().toString(),
-      time: now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-      date: now.toLocaleDateString([], { month: 'long', day: 'numeric' }),
-      bpm: actualBpm,
-      status: content.emotion,
-      verse: content.verse,
-      fullText: content.text
-    };
-
-    setBpm(actualBpm);
-    setIsSyncing(false);
-    setLogs(prev => [newLog, ...prev].slice(0, 10));
-
-    await Notifications.scheduleNotificationAsync({
-      content: {
-        title: `💬 Heart Guidance: ${content.emotion}`,
-        subtitle: `${content.verse} • ${actualBpm} BPM`,
-        body: `"${content.text}"`,
-        ios: { interruptionLevel: 'timeSensitive' },
-        ...Platform.select({ android: { channelId: 'messages' } })
-      },
-      trigger: null,
-    });
+    await monitor.startMonitoring();
   };
 
   return (
     <SafeAreaView style={styles.safeArea}>
       <Stack.Screen options={{ headerShown: false }} />
       <StatusBar barStyle="dark-content" />
-
+      
       <ScrollView contentContainerStyle={styles.scrollContainer} showsVerticalScrollIndicator={false}>
         <View style={styles.header}>
           <View>
             <Text style={styles.welcomeText}>Heart Verse</Text>
             <View style={styles.statusRow}>
-              <View style={[styles.statusDot, { backgroundColor: hasPermission ? '#4CD964' : '#FF3B30' }]} />
-              <Text style={styles.statusText}>{hasPermission ? "Watch Active" : "Disconnected"}</Text>
+              <View style={[styles.statusDot, { backgroundColor: effectivePermission ? '#4CD964' : '#FF3B30' }]} />
+              <Text style={styles.statusText}>{effectivePermission ? 'Watch Active' : 'Disconnected'}</Text>
             </View>
           </View>
-          <TouchableOpacity style={styles.profileCircle}><Ionicons name="person" size={20} color="#8E8E93" /></TouchableOpacity>
+          <TouchableOpacity style={styles.profileCircle} onPress={() => router.push('/profile')}>
+            <Ionicons name="person" size={20} color="#8E8E93" />
+          </TouchableOpacity>
         </View>
 
         <View style={[styles.mainCard, { borderColor: themeColor + '40' }]}>
           <View style={styles.cardHeader}>
             <Text style={styles.cardTitle}>Live Monitoring</Text>
-            {bpm > 0 && <View style={[styles.liveTag, { backgroundColor: themeColor }]}><Text style={styles.liveTagText}>LIVE</Text></View>}
+            <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+              {monitor.isStale && effectiveMonitoring && (
+                <View style={styles.staleTag}>
+                  <Ionicons name="time-outline" size={10} color="#FF9500" />
+                  <Text style={styles.staleTagText}>STALE</Text>
+                </View>
+              )}
+              {effectiveBpm > 0 && <View style={[styles.liveTag, { backgroundColor: themeColor }]}><Text style={styles.liveTagText}>LIVE</Text></View>}
+            </View>
           </View>
           <View style={styles.monitorContent}>
-            <View style={[styles.outerCircle, { borderColor: isSyncing ? themeColor : '#F2F2F7' }]}>
-              {isSyncing ? <ActivityIndicator size="large" color={themeColor} /> : (
+            <View style={[styles.outerCircle, { borderColor: effectiveMonitoring ? themeColor : '#F2F2F7' }]}>
+              {monitor.isLoading ? (
+                <ActivityIndicator size="large" color={themeColor} />
+              ) : effectiveMonitoring && effectiveBpm === 0 ? (
+                <View style={{ alignItems: 'center', paddingHorizontal: 12 }}>
+                  <ActivityIndicator size="small" color={themeColor} style={{ marginBottom: 8 }} />
+                  <Text style={styles.waitingText}>Waiting for{`\n`}heart rate…</Text>
+                </View>
+              ) : (
                 <View style={{ alignItems: 'center' }}>
                   <Ionicons name="heart" size={32} color={themeColor} />
-                  <Text style={styles.bpmNumber}>{bpm === 0 ? "--" : bpm}</Text>
+                  <Text style={styles.bpmNumber}>{effectiveBpm === 0 ? '--' : effectiveBpm}</Text>
                   <Text style={styles.bpmSubtext}>BPM</Text>
+                  {monitor.lastUpdated && (
+                    <Text style={{ fontSize: 9, color: '#AEAEC0', marginTop: 4 }}>
+                      {monitor.lastUpdated.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}
+                    </Text>
+                  )}
                 </View>
               )}
             </View>
           </View>
+          {monitor.error && (
+            <View style={styles.errorBanner}>
+              <Ionicons name="warning-outline" size={14} color="#FF3B30" />
+              <Text style={styles.errorBannerText}>{monitor.error}</Text>
+            </View>
+          )}
         </View>
+
+        {/* Compact banner shown while monitoring is active */}
+        {effectiveMonitoring && !watchTipDismissed && !isSimulating && Platform.OS === 'ios' && (
+          <View style={styles.watchBanner}>
+            <Ionicons name="watch" size={16} color="#FF9500" />
+            <Text style={styles.watchBannerText}>Start a workout on your Apple Watch for live BPM updates</Text>
+            <TouchableOpacity onPress={() => setWatchTipDismissed(true)}>
+              <Ionicons name="close" size={16} color="#FF9500" />
+            </TouchableOpacity>
+          </View>
+        )}
+
+        {/* Watch setup tip card — shown before monitoring starts */}
+        {!effectiveMonitoring && !watchTipDismissed && Platform.OS === 'ios' && (
+          <View style={styles.watchTipCard}>
+            <View style={styles.watchTipHeader}>
+              <View style={styles.watchTipIconBox}>
+                <Ionicons name="watch" size={20} color="#FF9500" />
+              </View>
+              <View style={{ flex: 1 }}>
+                <Text style={styles.watchTipTitle}>For Real-Time Updates</Text>
+                <Text style={styles.watchTipSubtitle}>Apple Watch + iPhone sync is controlled by iOS</Text>
+              </View>
+              <TouchableOpacity onPress={() => setWatchTipDismissed(true)}>
+                <Ionicons name="close-circle" size={22} color="#C7C7CC" />
+              </TouchableOpacity>
+            </View>
+            <View style={styles.watchTipDivider} />
+            <View style={styles.watchTipStep}>
+              <View style={styles.watchTipStepNum}><Text style={styles.watchTipStepNumText}>1</Text></View>
+              <Text style={styles.watchTipStepText}>On your Apple Watch, open the <Text style={{ fontWeight: '800' }}>Workout</Text> app</Text>
+            </View>
+            <View style={styles.watchTipStep}>
+              <View style={styles.watchTipStepNum}><Text style={styles.watchTipStepNumText}>2</Text></View>
+              <Text style={styles.watchTipStepText}>Select any workout type — <Text style={{ fontWeight: '800' }}>"Other"</Text> works great</Text>
+            </View>
+            <View style={styles.watchTipStep}>
+              <View style={styles.watchTipStepNum}><Text style={styles.watchTipStepNumText}>3</Text></View>
+              <Text style={styles.watchTipStepText}>Tap <Text style={{ fontWeight: '800' }}>Start Monitoring</Text> in this app — you'll get readings every 1-2 seconds</Text>
+            </View>
+            <TouchableOpacity style={styles.watchTipBtn} onPress={() => setWatchTipDismissed(true)}>
+              <Text style={styles.watchTipBtnText}>Got it</Text>
+            </TouchableOpacity>
+          </View>
+        )}
 
         <View style={styles.verseCard}>
           <View style={styles.verseHeader}>
@@ -289,9 +377,32 @@ export default function HomeScreen() {
       </Modal>
 
       <View style={styles.buttonContainer}>
-        <TouchableOpacity style={[styles.syncBtn, { backgroundColor: themeColor }]} onPress={syncHealthData} disabled={isSyncing}>
-          <Ionicons name={isSyncing ? "sync" : "pulse"} size={22} color="#FFF" style={{ marginRight: 10 }} />
-          <Text style={styles.syncBtnText}>{isSyncing ? "SYNCING..." : "SYNC HEART RATE"}</Text>
+        {/* DEV-only simulate button — tests real-time UI without a real Watch */}
+        {__DEV__ && !effectiveMonitoring && (
+          <TouchableOpacity
+            style={[styles.syncBtn, { backgroundColor: '#5856D6', marginBottom: 12 }]}
+            onPress={() => {
+              const bpmSequence = [62, 75, 88, 101, 115, 95, 78, 65, 72, 83, 110, 70];
+              let idx = 0;
+              setIsSimulating(true);
+              const firstBpm = bpmSequence[idx++ % bpmSequence.length];
+              setSimBpm(firstBpm);
+              handleNewBpm(firstBpm, new Date());
+              simulatePollInterval.current = setInterval(() => {
+                const fakeBpm = bpmSequence[idx++ % bpmSequence.length];
+                console.log('[SIM] fake BPM:', fakeBpm);
+                setSimBpm(fakeBpm);
+                handleNewBpm(fakeBpm, new Date());
+              }, 3000);
+            }}
+          >
+            <Ionicons name="flask" size={22} color="#FFF" style={{ marginRight: 10 }} />
+            <Text style={styles.syncBtnText}>SIMULATE (DEV)</Text>
+          </TouchableOpacity>
+        )}
+        <TouchableOpacity style={[styles.syncBtn, { backgroundColor: effectiveMonitoring ? '#FF3B30' : themeColor }]} onPress={toggleMonitoring}>
+          <Ionicons name={effectiveMonitoring ? 'stop-circle' : 'pulse'} size={22} color="#FFF" style={{ marginRight: 10 }} />
+          <Text style={styles.syncBtnText}>{effectiveMonitoring ? (isSimulating ? 'STOP SIMULATION' : 'STOP MONITORING') : 'START MONITORING'}</Text>
         </TouchableOpacity>
       </View>
     </SafeAreaView>
@@ -312,6 +423,11 @@ const styles = StyleSheet.create({
   cardTitle: { fontSize: 12, fontWeight: '800', color: '#AEAEC0', textTransform: 'uppercase' },
   liveTag: { paddingHorizontal: 10, paddingVertical: 4, borderRadius: 8 },
   liveTagText: { color: '#FFF', fontSize: 10, fontWeight: '900' },
+  staleTag: { flexDirection: 'row', alignItems: 'center', gap: 3, paddingHorizontal: 8, paddingVertical: 4, borderRadius: 8, backgroundColor: '#FFF3E0', borderWidth: 1, borderColor: '#FF950040' },
+  staleTagText: { color: '#FF9500', fontSize: 10, fontWeight: '800' },
+  waitingText: { fontSize: 12, color: '#AEAEC0', fontWeight: '600', textAlign: 'center', lineHeight: 18 },
+  errorBanner: { flexDirection: 'row', alignItems: 'center', gap: 6, backgroundColor: '#FFF1F0', borderRadius: 12, padding: 10, marginTop: 12, borderWidth: 1, borderColor: '#FF3B3030' },
+  errorBannerText: { flex: 1, fontSize: 12, color: '#FF3B30', fontWeight: '600' },
   monitorContent: { alignItems: 'center', paddingBottom: 10 },
   outerCircle: { width: 160, height: 160, borderRadius: 80, borderWidth: 4, alignItems: 'center', justifyContent: 'center', backgroundColor: '#FDFDFF' },
   bpmNumber: { fontSize: 52, fontWeight: '800', color: '#1C1C1E' },
@@ -323,6 +439,20 @@ const styles = StyleSheet.create({
   verseRef: { fontSize: 22, fontWeight: '700', color: '#1C1C1E', marginBottom: 8 },
   verseText: { fontSize: 16, color: '#48484A', lineHeight: 24, fontStyle: 'italic' },
   adviceText: { fontSize: 13, color: '#8E8E93', marginTop: 12, fontWeight: '500' },
+  watchBanner: { flexDirection: 'row', alignItems: 'center', gap: 8, backgroundColor: '#FFF3E0', borderRadius: 16, padding: 14, marginBottom: 20, borderWidth: 1, borderColor: '#FFCC0040' },
+  watchBannerText: { flex: 1, fontSize: 12, color: '#FF9500', fontWeight: '600' },
+  watchTipCard: { backgroundColor: '#FFF', borderRadius: 24, padding: 20, marginBottom: 20, borderWidth: 1.5, borderColor: '#FF950030', shadowColor: '#FF9500', shadowOpacity: 0.08, shadowRadius: 12, elevation: 3 },
+  watchTipHeader: { flexDirection: 'row', alignItems: 'center', gap: 12, marginBottom: 16 },
+  watchTipIconBox: { width: 40, height: 40, borderRadius: 12, backgroundColor: '#FFF3E0', justifyContent: 'center', alignItems: 'center' },
+  watchTipTitle: { fontSize: 15, fontWeight: '800', color: '#1C1C1E' },
+  watchTipSubtitle: { fontSize: 11, color: '#8E8E93', fontWeight: '500', marginTop: 2 },
+  watchTipDivider: { height: 1, backgroundColor: '#F2F2F7', marginBottom: 16 },
+  watchTipStep: { flexDirection: 'row', alignItems: 'flex-start', gap: 12, marginBottom: 14 },
+  watchTipStepNum: { width: 24, height: 24, borderRadius: 12, backgroundColor: '#FF9500', justifyContent: 'center', alignItems: 'center', marginTop: 1 },
+  watchTipStepNumText: { color: '#FFF', fontSize: 12, fontWeight: '900' },
+  watchTipStepText: { flex: 1, fontSize: 13, color: '#48484A', lineHeight: 20, fontWeight: '500' },
+  watchTipBtn: { marginTop: 6, backgroundColor: '#FF9500', borderRadius: 14, paddingVertical: 12, alignItems: 'center' },
+  watchTipBtnText: { color: '#FFF', fontWeight: '800', fontSize: 14 },
   logSection: { width: '100%' },
   logHeading: { fontSize: 18, fontWeight: '800', color: '#1C1C1E', marginBottom: 15 },
   logItem: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', backgroundColor: '#FFF', padding: 18, borderRadius: 20, marginBottom: 12 },
