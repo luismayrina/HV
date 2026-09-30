@@ -41,3 +41,7 @@ app-example
 # generated native folders
 /ios
 /android
+
+# Build output from the algorithm training and test scripts
+.train-build/
+.test-build/

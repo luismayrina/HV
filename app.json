@@ -76,7 +76,9 @@
         }
       ],
       "expo-web-browser",
-      "./plugins/withHealthConnectAndroid14"
+      "./plugins/withHealthConnectAndroid14",
+      "expo-sqlite",
+      "expo-background-task"
     ],
     "experiments": {
       "typedRoutes": true,

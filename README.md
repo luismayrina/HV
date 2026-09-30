@@ -23,6 +23,7 @@ A cross-platform (iOS + Android) React Native / Expo app for **live heart-rate m
 - [Health platform setup](#health-platform-setup)
 - [HeartSim — simulator data source](#heartsim--simulator-data-source)
 - [Demo builds & watermark](#demo-builds--watermark)
+- [Emotion-aware scripture recommendation (RPRV pipeline)](#emotion-aware-scripture-recommendation-rprv-pipeline)
 - [Project structure](#project-structure)
 - [npm scripts](#npm-scripts)
 - [Troubleshooting](#troubleshooting)
@@ -343,6 +344,114 @@ EXPO_PUBLIC_BUILD_TYPE=production
 ```
 
 Since the value is inlined at bundle time, you must rebuild the binary (or restart Metro for a dev build) after changing it — flipping it on an already-built APK has no effect.
+
+---
+
+## Emotion-aware scripture recommendation (RPRV pipeline)
+
+HV analyses **Radial Pulse Rate Variability** to infer an emotional state and deliver a
+matching King James Version verse. This implements the algorithm specified in the project
+outline paper.
+
+### The pipeline
+
+Every 30 seconds, while the app is open (and periodically in the background):
+
+| Stage | Module | What it does |
+|---|---|---|
+| 1. Features | [`lib/rprv/features.ts`](lib/rprv/features.ts) | Turns a window of pulse samples into 12 features: time-domain (mean RR, SDNN, RMSSD, pNN50), frequency-domain (LF/HF power and ratio, via a Lomb-Scargle periodogram), entropy, and behavioural (inactivity, hour of day). |
+| 2. SWIBSEA | [`lib/rprv/swibsea.ts`](lib/rprv/swibsea.ts) | Sample entropy over a sliding window. Low entropy = reduced variability = sympathetic dominance = stress. Compared against the user's personalised baseline. |
+| 3. Random Forest | [`lib/rprv/randomForest.ts`](lib/rprv/randomForest.ts) | 60 decision trees, each grown on a bootstrap sample with a random feature subset. Majority vote across trees gives the emotional state; the winning vote share is the confidence. |
+| 4. State machine | [`lib/rprv/fsm.ts`](lib/rprv/fsm.ts) | CALM → ELEVATED → STRESS → ACUTE, with the paper's transition table. Decides the notification tier. |
+| 5. Recommender | [`lib/verses/recommender.ts`](lib/verses/recommender.ts) | Weighted scoring — 60% emotional state fit, 25% recent engagement, 15% historical preference — refined by situational rules (morning, evening, prolonged inactivity, repeated stress, post-exertion). |
+
+### Notification tiers
+
+| State | Tier | Theme | Also does |
+|---|---|---|---|
+| CALM | none | — | — |
+| ELEVATED | Level 1 | peace, comfort | — |
+| STRESS | Level 2 | strength, hope | — |
+| ACUTE | Level 3 | protection, courage | Offers to text emergency contacts; schedules a wellbeing check-in |
+
+Two rules sit alongside the paper's entropy-relative transitions:
+
+- **Warning threshold** (default **120 bpm**) forces at least ELEVATED and sends a plain
+  high-heart-rate notification, independent of the emotional analysis.
+- **Emergency threshold** (default **150 bpm**) forces ACUTE.
+
+Both are editable in Settings — the paper's design is personalised, and what counts as
+dangerous depends on the individual.
+
+### Daily cycle
+
+- **08:00–17:00** — the collection window.
+- **08:00–12:00** — the morning segment, from which the day's **personalised baseline
+  entropy** is computed. Until that baseline exists, entropy rules are switched off and only
+  the absolute heart-rate thresholds are active. This is what makes "calm in the morning,
+  elevated in the afternoon" a meaningful comparison.
+- **17:01** — the daily summary notification: the day's **peak heart rate** and a verse
+  chosen from the day's dominant emotional state.
+
+### Screens
+
+- **Home** — live BPM, current state and emotion, the current verse with a helpful/not-helpful rating.
+- **Algorithm** (`/algorithm`) — the full computation behind the current output: entropy vs
+  baseline and the thresholds, the feature vector, per-class tree votes, one tree's decision
+  path, every FSM rule evaluated (including those that did not fire), the verse score
+  breakdown, and the model's cross-validated performance.
+- **Analysis** (`/analysis`) — previous daily records, today's episodes, per-verse
+  helpfulness, check-in history, and the stated limitations.
+- **Settings** (`/settings`) — thresholds, collection window, emergency contacts.
+
+### Training the model
+
+```bash
+npm run train:model
+```
+
+Regenerates `lib/rprv/model.json`: builds the dataset, runs stratified 5-fold
+cross-validation, prints a confusion matrix and feature importances, then trains the final
+forest.
+
+```bash
+npm run test:algo
+```
+
+Runs the algorithm test suite, including the paper's own worked scenario.
+
+> **The shipped model is trained on synthetic data.** The paper specifies the PhysioNet
+> Fantasia dataset plus supplemental PRV-labelled data; that corpus is not bundled here.
+> The trainer instead synthesises physiologically-shaped RR series (class-specific heart
+> rate, HF respiratory oscillation, LF Mayer waves, noise) and runs them through the same
+> `extractFeatures()` the app uses at runtime. **The cross-validation accuracy therefore
+> measures separation of simulated classes — it is not evidence of accuracy against real
+> human emotion and must not be cited as such.** To train on a real corpus, implement
+> `loadRealDataset()` in `scripts/train-random-forest.ts`; nothing else needs to change.
+
+### Known limitations
+
+1. **Sampling rate.** The paper assumes raw beat-to-beat intervals from a PPG sensor
+   (~70 per 60 s window). A phone reading Health Connect or HealthKit receives one *averaged*
+   bpm every 3–5 s, giving only 12–20 points per 60 s window. Measured on simulated
+   calm-vs-stress series, sample entropy over 12 points separates the conditions with an
+   effect size of **d = −0.03** — pure noise. The implementation therefore keeps the paper's
+   30-second evaluation cadence but widens the span the entropy is *computed* over until it
+   holds at least 30 intervals (target 60, cap 300 s), and adapts the embedding dimension to
+   the series length. The span actually used is shown on the algorithm screen.
+2. **Background execution.** Continuous recording is a backfill from the platform health
+   store, not a live capture. Android's WorkManager floor is ~15 minutes and iOS is stricter,
+   so a tier notification may arrive late. No data is lost — the health store keeps the
+   samples and each run recomputes the day — but alerting is not instant.
+3. **Inactivity is inferred** from heart-rate elevation, not from step data. It only biases
+   verse selection, never an alert.
+4. **Verse corpus discrepancy.** The paper bounds the corpus to a specific chapter list, but
+   its own situational rules name verses outside that list (2 Timothy 1:7, Lamentations
+   3:22–23, Psalm 143:8, Psalm 4:8, Exodus 14:14). Those verses are included and flagged with
+   `outsideStatedScope: true` in [`lib/verses/corpus.ts`](lib/verses/corpus.ts).
+5. **Emergency contacts are never messaged automatically.** Level 3 opens the SMS composer
+   pre-filled; the user presses send.
+6. **Not a medical device.** Emotional states are inferred, not measured.
 
 ---
 
